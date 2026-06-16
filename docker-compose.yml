@@ -1,0 +1,33 @@
+services:
+  mednext:
+    image: mednext:cu118
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: mednext-cu118
+
+    working_dir: /workspace/MedNeXt
+
+    volumes:
+      - .:/workspace/MedNeXt
+      - ./data/nnUNet_raw:/workspace/data/nnUNet_raw
+      - ./data/nnUNet_preprocessed:/workspace/data/nnUNet_preprocessed
+      - ./outputs/nnUNet_results:/workspace/outputs/nnUNet_results
+
+    environment:
+      - nnUNet_raw_data_base=/workspace/data/nnUNet_raw
+      - nnUNet_preprocessed=/workspace/data/nnUNet_preprocessed
+      - RESULTS_FOLDER=/workspace/outputs/nnUNet_results
+      - PYTHONUNBUFFERED=1
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    stdin_open: true
+    tty: true
