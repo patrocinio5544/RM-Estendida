@@ -12,3 +12,21 @@ checkpoints/
 *.dcm
 
 .ipynb_checkpoints
+
+# datasets / medical data
+data/00_raw/
+data/01_extracted/
+data/02_preprocessed/
+data/nnUNet_raw/
+data/nnUNet_preprocessed/
+data/nnUNet_results/
+
+# training outputs
+outputs/
+
+# packaged datasets
+artifacts/datasets/*.tar
+artifacts/datasets/*.tar.gz
+artifacts/datasets/*.tar.zst
+artifacts/datasets/*.sha256
+artifacts/datasets/*_manifest.txt
