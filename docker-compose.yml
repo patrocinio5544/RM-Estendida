@@ -1,5 +1,6 @@
 services:
   mednext:
+    shm_size: "64gb"
     image: mednext:cu118
     build:
       context: .
