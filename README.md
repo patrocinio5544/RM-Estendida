@@ -1,231 +1,316 @@
-# MedNeXt
+# MedNeXt — RM-Estendida — Treino em VM Linux (RunPod)
 
-Copyright © German Cancer Research Center (DKFZ), [Division of Medical Image Computing (MIC)](https://www.dkfz.de/en/mic/index.php). Please make sure that your usage of this code is in compliance with the [code license](https://github.com/MIC-DKFZ/MedNeXt/blob/main/LICENSE). 
+Guia operacional para treinar o **MedNeXt** sobre o dataset **Task220_PI-CAI**
+em uma VM Linux com GPU (referência: **RunPod**), partindo de um pacote
+`pi_cai220_mednext.tar.zst` que contém **apenas o dataset raw** (imagens, labels,
+`dataset.json`, `splits_final.json`). O pré-processamento e o *integrity check*
+rodam na própria VM.
 
-**MedNeXt** is a fully ConvNeXt architecture for 3D medical image segmentation designed to leverage the 
-scalability of the ConvNeXt block while being customized to the challenges of sparsely annotated medical 
-image segmentation datasets. MedNeXt is a model under development and is expected to be updated 
-periodically in the near future. 
+> Branch desta documentação: `RM-Estendida-VM`.
+> A rota Docker/Compose continua válida para WSL/local e está no `README.md` original.
+> Em RunPod o caminho mais eficiente é rodar **nativo no pod** (a imagem já é um
+> container com torch), sem Docker-in-Docker.
 
-The current training framework is built on top of nnUNet (v1) - the module name `nnunet_mednext` reflects this. You are free to adopt the architecture for your own training pipeline or use the one in this repository. Instructions are provided for both paths. 
+---
 
-[**[arXiv, 2023]**](https://arxiv.org/abs/2303.09975) [**[MICCAI 2023]**](https://link.springer.com/chapter/10.1007/978-3-031-43901-8_39)
+## 1. Sumário: o que deu certo e o que deu errado (ambiente local / WSL)
 
-Please cite the following work if you find this model useful for your research:
+Registro das lições da validação local, para não repetir os mesmos tropeços na VM.
 
-    Roy, S., Koehler, G., Ulrich, C., Baumgartner, M., Petersen, J., Isensee, F., Jaeger, P.F. & Maier-Hein, K. (2023).
-    MedNeXt: Transformer-driven Scaling of ConvNets for Medical Image Segmentation. 
-    International Conference on Medical Image Computing and Computer-Assisted Intervention (MICCAI), 2023.
+**Funcionou:**
+- `nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04` + torch 2.1.0 cu118 é a base estável.
+- Docker Engine instalado pelo repositório oficial + NVIDIA Container Toolkit.
+- O pacote `.tar.zst` traz a árvore a partir de `data/`, então extrai na **raiz do projeto**.
+- `tar -I zstd -tvf` para inspecionar antes de extrair evitou duplicar pastas.
 
-Please also cite the following work if you use this pipeline for training:
+**Tropeços e correções:**
+- **`[boot]` / `systemd=true` digitados no terminal** → eram conteúdo do arquivo
+  `/etc/wsl.conf`, não comandos. Como o `systemctl` já respondia, o systemd já
+  estava ativo e o `wsl.conf` foi dispensável.
+- **`permission denied` no `docker.sock`** → faltava aplicar o grupo `docker` na
+  sessão. Resolvido com `usermod -aG docker $USER` + `newgrp docker` (ou
+  `wsl --shutdown` e reabrir).
+- **`TLS handshake timeout` ao puxar imagem** → conectividade/DNS do WSL.
+  Mitigado fixando DNS (`generateResolvConf = false` + `resolv.conf` com 1.1.1.1/8.8.8.8).
+- **Expectativa de "treinar direto"** → o pacote **não** tinha `nnUNet_preprocessed`
+  nem `plans`. Foi preciso rodar `mednextv1_plan_and_preprocess` (que também faz o
+  *integrity check*) antes do treino.
+- **Nome da task com hífen** (`Task220_PI-CAI`) → usar sempre o **número** (`220`)
+  nos comandos do nnUNet/MedNeXt.
 
-    Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2020). 
-    nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. Nature Methods, 1-9.
+---
 
-# Table of Contents
-- [MedNeXt](#mednext)
-- [Table of Contents](#table-of-contents)
-- [Current version and notable features](#current-versions-and-notable-features)
-- [Installation](#installation)
-- [MedNeXt Architecture and Usage in external pipelines](#mednext-architecture-and-usage-in-external-pipelines)
-  - [MedNeXt v1](#mednext-v1)
-    - [Usage as whole MedNeXt v1 architecture](#usage-as-whole-mednext-v1-architecture)
-    - [Individual Usage of MedNeXt blocks](#individual-usage-of-mednext-blocks)
-    - [UpKern weight loading](#upkern-weight-loading)
-- [Usage of internal training pipeline](#usage-of-internal-training-pipeline)
-    - [Plan and Preprocess](#plan-and-preprocess)
-    - [Train MedNeXt using nnUNet (v1) training](#train-mednext-using-nnunet-v1-training)
-    - [Train a kernel 5x5x5 version using UpKern](#train-a-kernel-5x5x5-version-using-upkern)
+## 2. Escolha da GPU por tamanho de modelo
 
-# Current Versions and notable features:
+MedNeXt v1 é 3D com patch `128×128×128` e *spacing* 1mm isotrópico — é pesado em VRAM.
+Valores abaixo são **estimativas** (variam com batch, deep supervision e gradient
+checkpointing). MedNeXt suporta *gradient checkpointing* para caber modelos grandes
+em menos memória, trocando memória por compute.
 
-- **v1 (MICCAI 2023)**: Fully 3D ConvNeXt architecture, residual ConvNeXt resampling, UpKern for large kernels, gradient checkpointing for training large models
+| Modelo (ID) | Params | Kernel | VRAM mínima viável | GPU confortável (RunPod) |
+|-------------|--------|--------|--------------------|--------------------------|
+| Small (S)   | 5.6–5.9M  | 3 / 5 | ~12–16 GB | RTX 4090 24 GB / A5000 |
+| Base (B)    | 10.5–11M  | 3 / 5 | ~16–24 GB | RTX 4090 24 GB / A6000 48 GB |
+| **Medium (M)** | 17.6–18.3M | 3 / 5 | ~24–40 GB | **A100 80 GB / H100 / H200 141 GB** |
+| Large (L)   | 61.8–63M  | 3 / 5 | ~40–80 GB | H100 80 GB / **H200 141 GB** |
 
-As mentioned earlier, MedNeXt is actively under development and further improvements to the pipeline as future versions are anticipated.
+**Neste guia o exemplo usa Medium (M) na variante mais pesada (kernel 5 via UpKern),
+em uma H200.** A H200 (141 GB) dá folga grande para o Medium: permite kernel 5
+confortável, batch maior e não exige gradient checkpointing.
 
-# Installation
-The repository can be cloned and installed using the following commands.
+Regra prática: para *desenvolver/depurar* use a menor GPU que couber (mais barata);
+para o *treino final* suba para a GPU "confortável" da linha correspondente.
+
+---
+
+## 3. Provisionar a VM no RunPod
+
+1. **Storage primeiro (recomendado):** crie um **Network Volume** (Secure Cloud).
+   Ele persiste após o pod ser terminado e monta em `/workspace`. Dimensione para
+   o dataset + pré-processado + checkpoints (ex.: 100–200 GB). O volume fica preso
+   ao datacenter escolhido, então selecione um datacenter com a GPU desejada.
+2. **Deploy do Pod:** em *Pods → Deploy*, anexe o Network Volume **durante a criação**
+   (não dá para anexar depois), escolha a GPU (ex.: **H200** para o Medium) e o template.
+3. **Template:** use uma imagem PyTorch que já bata com o stack do projeto, p.ex.
+   `runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel`. Assim torch 2.1.0 + CUDA 11.8 já
+   vêm prontos e você só instala o MedNeXt por cima.
+4. **Acesso:** suba sua chave SSH em *Settings* e conecte via SSH, ou use o terminal web.
+5. **Auto-shutdown:** ative timeout de inatividade para não pagar pod ocioso.
+
+> Tudo que você quer preservar entre sessões deve ficar em `/workspace`
+> (o Network Volume). O disco do container some quando o pod é terminado.
+
+---
+
+## 4. Preparar o ambiente no pod
+
+Trabalhe sempre dentro de `/workspace` (volume persistente).
 
 ```bash
-git clone https://github.com/MIC-DKFZ/MedNeXt.git mednext
+cd /workspace
+
+# ferramentas base
+apt-get update && apt-get install -y git zstd build-essential curl
+
+# clonar a branch de VM
+git clone -b RM-Estendida-VM https://github.com/patrocinio5544/RM-Estendida.git mednext
 cd mednext
+
+# estrutura de pastas (mesma lógica do compose, agora em /workspace)
+mkdir -p data/nnUNet_raw data/nnUNet_preprocessed outputs/nnUNet_results
+```
+
+Instalar o MedNeXt. Como o template já tem torch 2.1.0 cu118, **não reinstale torch**:
+
+```bash
+pip install -r requirements_docker.txt   # mesmas deps validadas da imagem
 pip install -e .
 ```
 
-# MedNeXt Architecture and Usage in external pipelines
-MedNeXt is usable on external training pipeline for 3D volumetric segmentation, similar to any PyTorch `nn.Module`. It is functionally decoupled from nnUNet when used simply as an architecture. It is sufficient to install the repository and import either the architecture or the block. In theory, it is possible to freely customize the network using MedNeXt both as an encoder-decoder style network as well as a block.
+Exportar os paths do nnUNet (no pod nativo não há compose para setar env).
+Coloque no `~/.bashrc` para persistir entre logins:
 
-## MedNeXt v1 
-
-MedNeXt v1 is the first version of the MedNeXt and incorporates the architectural features described [here](#current-versions-and-notable-features). 
-
-**_Important_:** MedNeXt v1 was trained with *1.0mm isotropic spacing* as favored by architectures like [UNETR](https://arxiv.org/abs/2103.10504), [SwinUNETR](https://arxiv.org/abs/2201.01266) and the usage of alternate spacing, like *median spacing* favored by native nnUNet, while perfectly usable in theory, is currently untested with MedNeXt v1 and may affect performance.
-
-The usage as whole MedNeXt v1 as a complete architecture as well as the use of MedNeXt blocks (in external architectures, for example) is described below.
-
-### Usage as whole MedNeXt v1 architecture:
-
-The architecture can be imported as follows with a number of arguments.
-
-```
-from nnunet_mednext.mednextv1 import MedNeXt
-
-model = MedNeXt(
-          in_channels: int,                         # input channels
-          n_channels: int,                          # number of base channels
-          n_classes: int,                           # number of classes
-          exp_r: int = 4,                           # Expansion ratio in Expansion Layer
-          kernel_size: int = 7,                     # Kernel Size in Depthwise Conv. Layer
-          enc_kernel_size: int = None,              # (Separate) Kernel Size in Encoder
-          dec_kernel_size: int = None,              # (Separate) Kernel Size in Decoder
-          deep_supervision: bool = False,           # Enable Deep Supervision
-          do_res: bool = False,                     # Residual connection in MedNeXt block
-          do_res_up_down: bool = False,             # Residual conn. in Resampling blocks
-          checkpoint_style: bool = None,            # Enable Gradient Checkpointing
-          block_counts: list = [2,2,2,2,2,2,2,2,2], # Depth-first no. of blocks per layer 
-          norm_type = 'group',                      # Type of Norm: 'group' or 'layer'
-          dim = '3d'                                # Supports `3d', '2d' arguments
-)
+```bash
+cat >> ~/.bashrc <<'EOF'
+export nnUNet_raw_data_base=/workspace/mednext/data/nnUNet_raw
+export nnUNet_preprocessed=/workspace/mednext/data/nnUNet_preprocessed
+export RESULTS_FOLDER=/workspace/mednext/outputs/nnUNet_results
+EOF
+source ~/.bashrc
 ```
 
-Please note that - 1) Deep Supervision, and 2) residual connections in both MedNeXt and Up/Downsampling blocks are both used in the publication for training. 
+Validar GPU e paths (o "exportar paths via python3"):
 
-Gradient Checkpointing can be used to train larger models in low memory devices by trading compute for activation storage. The checkpointing implemented in this version is at the MedNeXt block level.
-
-MedNeXt v1  has been tested with 4 defined architecture sizes and 2 defined kernel sizes. Their particulars are as follows:
-
-| Name (Model ID) | Kernel Size | Parameters | GFlops |
-|-----|---- |-----| -----|
-| Small (S) | 3x3x3 | 5.6M | 130 | 
-| Small (S) | 5x5x5 | 5.9M | 169 |
-| Base (B) | 3x3x3 | 10.5M | 170 |
-| Base (B) | 5x5x5 | 11.0M | 208 |
-| Medium (M) | 3x3x3 | 17.6M | 248 |
-| Medium (M) | 5x5x5 | 18.3M | 308 |
-| Large (L) | 3x3x3 | 61.8M | 500 |
-| Large (L) | 5x5x5 | 63.0M | 564 |
-
-Utility functions have been defined for re-creating these architectures (with or without deep supervision) as follows customized to input channels, number of target classes, model IDs as used in the publication, kernel size and deep supervision:
-
-```
-from nnunet_mednext import create_mednext_v1
-
-model = create_mednext_v1(
-  num_channels = 3,
-  num_classes = 10,
-  model_id = 'B',             # S, B, M and L are valid model ids
-  kernel_size = 3,            # 3x3x3 and 5x5x5 were tested in publication
-  deep_supervision = True     # was used in publication
-)
+```bash
+python3 -c "import torch; print('CUDA:', torch.cuda.is_available(), '|', torch.cuda.get_device_name(0))"
+python3 -c "import os; [print(k,'=',os.environ.get(k)) for k in ['nnUNet_raw_data_base','nnUNet_preprocessed','RESULTS_FOLDER']]"
 ```
 
-### Individual Usage of MedNeXt blocks
-MedNeXt blocks can be imported for use individually similar to the entire architecture. The following blocks can be imported directed for use.
+---
 
-```
-from nnunet_mednext import MedNeXtBlock, MedNeXtDownBlock, MedNeXtUpBlock
+## 5. Obter o dataset
 
-# Standard MedNeXt block
-block = MedNeXtBlock(
-    in_channels:int,              # no. of input channels
-    out_channels:int,             # no. of output channels
-    exp_r:int=4,                  # channel expansion ratio in Expansion Layer
-    kernel_size:int=7,            # kernel size in Depthwise Conv. Layer
-    do_res:bool=True,              # residual connection on or off. Default: True
-    norm_type:str = 'group',      # type of norm: 'group' or 'layer'
-    n_groups:int or None = None,  # no. of groups in Depthwise Conv. Layer
-                                  # (keep 'None' in most cases)
-)
+Duas rotas. Use **uma**. Em ambos os casos o alvo é
+`/workspace/mednext/pi_cai220_mednext.tar.zst`.
 
+### Rota A — Cópia (do seu local para o pod)
 
-# 2x Downsampling with MedNeXt block
-block_down = MedNeXtDownBlock(
-    in_channels:int,              # no. of input channels
-    out_channels:int,             # no. of output channels
-    exp_r:int=4,                  # channel expansion ratio in Expansion Layer
-    kernel_size:int=7,            # kernel size in Depthwise Conv. Layer
-    do_res:bool=True,              # residual connection on or off. Default: True
-    norm_type:str = 'group',      # type of norm: 'group' or 'layer'
-)
+Mais simples se o arquivo já está na sua máquina.
 
-
-# 2x Upsampling with MedNeXt block
-block_up = MedNeXtUpBlock(
-    in_channels:int,              # no. of input channels
-    out_channels:int,             # no. of output channels
-    exp_r:int=4,                  # channel expansion ratio in Expansion Layer
-    kernel_size:int=7,            # kernel size in Depthwise Conv. Layer
-    do_res:bool=True,              # residual connection on or off. Default: True
-    norm_type:str = 'group',      # type of norm: 'group' or 'layer'
-)
+**A.1 `runpodctl` (relay com código único, sem IP):**
+```bash
+# Na sua máquina local (com runpodctl instalado e logado):
+runpodctl send pi_cai220_mednext.tar.zst
+# ele imprime um código; no pod:
+runpodctl receive <CODIGO>
 ```
 
-### UpKern weight loading
-
-UpKern is a simple algorithm for initializing a large kernel MedNeXt network with an *equivalent* small kernel MedNeXt. Equivalent refers to a network of the same configuration with the *only* difference being kernel size in the Depthwise Convolution layers. 
-Large kernels are initialized by trilinear interpolation of their smaller counterparts.
-The following is an example of using this weight loading style.
-
-```
-from nnunet_mednext import create_mednext_v1
-from nnunet_mednext.run.load_weights import upkern_load_weights
-m_net_ = create_mednext_v1(1, 3, 'S', 5)
-m_pre = create_mednext_v1(1, 3, 'S', 3)
-
-# Generally m_pre would be pretrained
-m3 = upkern_load_weights(m_net_, m_pre)
+**A.2 `rsync`/`scp` via SSH (bom para arquivos grandes, retomável):**
+```bash
+# Na sua máquina local (pegue host/porta SSH do pod no painel do RunPod):
+rsync -avzP -e "ssh -p <PORTA>" \
+  pi_cai220_mednext.tar.zst root@<IP_DO_POD>:/workspace/mednext/
+# --inplace permite retomar se cair:
+# rsync -avzP --inplace -e "ssh -p <PORTA>" ...
 ```
 
-# Usage of internal training pipeline
+### Rota B — rclone a partir do Google Drive
 
-## Plan and Preprocess
+Link fixado do dataset:
+`https://drive.google.com/file/d/1zU7dQcDF65Ag2bDZ-5neL4raTte8SawN/view?usp=sharing`
+(file ID: `1zU7dQcDF65Ag2bDZ-5neL4raTte8SawN`)
 
-To preprocess your datasets as in the MICCAI 2023 version, please run
-
-```
-mednextv1_plan_and_preprocess -t YOUR_TASK -pl3d ExperimentPlanner3D_v21_customTargetSpacing_1x1x1 -pl2d ExperimentPlanner2D_v21_customTargetSpacing_1x1x1
-```
-
-As in nnUNet, you can set `-pl3d` or `-pl2d` as `None` if you do not require preprocessed data in those dimensions.
-Please note that `YOUR_TASK` in this repo is designed to be in the old nnUNet(v1) format. If you want to use the 
-latest nnUNet (v2), you will have to adopt the preprocessor on your own.
-
-The custom `ExperimentPlanner3D_v21_customTargetSpacing_1x1x1` is designed to set patch size to `128x128x128` and
-spacing to 1mm isotropic since those are the experimental conditions used in the MICCAI 2023 version. 
-
-## Train MedNeXt using nnUNet (v1) training
-MedNeXt has custom nnUNet (v1) trainers that allow it to be trained similar to the base architecture. 
-Please check the old nnUNet(v1) branch in the nnUNet repo, if you are unfamiliar with this code format. Please look [here](https://github.com/MIC-DKFZ/MedNeXt/blob/main/nnunet_mednext/training/network_training/MedNeXt/nnUNetTrainerV2_MedNeXt.py) for all available trainers to recreate the MICCAI 2023 experiments. Please note that all trainers are in 3D since the architecture was tested in 3D. You can of course, create your custom trainers if you want (including 2D trainers for 2D architectures). 
-```
-mednextv1_train 3d_fullres TRAINER TASK_NUMBER FOLD -p nnUNetPlansv2.1_trgSp_1x1x1
+**B.0 Atalho para ESTE link específico (mais rápido):** se o arquivo está
+compartilhado como "qualquer pessoa com o link", `gdown` baixa direto pelo ID,
+sem configurar OAuth:
+```bash
+pip install gdown
+gdown 1zU7dQcDF65Ag2bDZ-5neL4raTte8SawN -O /workspace/mednext/pi_cai220_mednext.tar.zst
 ```
 
-There are trainers for 4 architectures (`S`, `B`, `M`, `L`) and 2 kernel sizes (3, 5) to replicate the experiments from MICCAI 2023.
-The following is an example for training an `nnUNetTrainerV2_MedNeXt_S_kernel3` trainer on the task `Task040_KiTS2019` on fold 0
-of the 5-folds split generated by nnUNet's data preprocessor.
+Se preferir/precisar do **rclone** (necessário quando o arquivo está no *seu* Drive
+e não público), siga abaixo.
 
-```
-mednextv1_train 3d_fullres nnUNetTrainerV2_MedNeXt_S_kernel3 Task040_KiTS2019 0 -p nnUNetPlansv2.1_trgSp_1x1x1
-```
-
-A kernel `5x5x5` version from scratch can also be trained this way, although we recommend initially training a kernel `3x3x3` version
-and using UpKern.
-
-## Train a kernel 5x5x5 version using UpKern
-To train a kernel `5x5x5` version using UpKern, a kernel `3x3x3` version must already be trained. To train using UpKern, simply run the 
-following:
-
-```
-mednextv1_train 3d_fullres TRAINER TASK FOLD -p nnUNetPlansv2.1_trgSp_1x1x1 -pretrained_weights YOUR_MODEL_CHECKPOINT_FOR_KERNEL_3_FOR_SAME_TASK_AND_FOLD -resample_weights
+**B.1 Instalar rclone no pod:**
+```bash
+curl https://rclone.org/install.sh | bash
+rclone version
 ```
 
-The following is an example for training an `nnUNetTrainerV2_MedNeXt_S_kernel5` trainer on the task `Task040_KiTS2019` on fold 0 of the 5-folds split generated by nnUNet's data preprocessor by using UpKern.
+**B.2 Configurar o remote do Google Drive (fluxo headless).**
+O pod não tem navegador, então a autorização é feita na sua máquina local.
 
+No **pod**:
+```bash
+rclone config
+# n) New remote
+# name> gdrive
+# Storage> drive          (Google Drive)
+# client_id>              (Enter — em branco)
+# client_secret>          (Enter — em branco)
+# scope> 1                (Full access)
+# service_account_file>   (Enter — em branco)
+# Edit advanced config? > n
+# Use web browser to automatically authenticate? > n   <-- N, é headless
 ```
-mednextv1_train 3d_fullres nnUNetTrainerV2_MedNeXt_S_kernel5 Task040_KiTS2019 0 -p nnUNetPlansv2.1_trgSp_1x1x1 -pretrained_weights SOME_PATH/nnUNet/3d_fullres/Task040_KiTS2019/nnUNetTrainerV2_MedNeXt_S_kernel3__nnUNetPlansv2.1_trgSp_1x1x1/fold_0/model_final_checkpoint.model -resample_weights
+O rclone vai imprimir um comando como:
+```
+rclone authorize "drive" "eyJ...base64..."
+```
+Copie esse comando inteiro e rode **na sua máquina local** (que tem navegador e
+rclone instalado). O navegador abre, você loga na conta do Drive e autoriza.
+O rclone local imprime um **token** (JSON). Copie esse token e cole de volta no
+pod, no prompt `config_token>`. Finalize:
+```
+# Configure this as a Shared Drive (Team Drive)? > n
+# y) Yes this is OK
+# q) Quit config
 ```
 
-The `-resample_weights` flag as it is responsible to triggering the UpKern algorithm.
+**B.3 Validar o remote:**
+```bash
+rclone listremotes            # deve mostrar "gdrive:"
+rclone lsd gdrive:            # lista pastas do seu Drive (sanity check)
+```
 
-### A note on 2D MedNeXt:
-Please note that while the MedNeXt can run on 2D, it has not been tested in 2D mode.
+**B.4 Baixar o dataset.** Se o arquivo está na raiz do *seu* Drive:
+```bash
+rclone copy "gdrive:pi_cai220_mednext.tar.zst" /workspace/mednext/ -P
+```
+Se o arquivo veio de um link compartilhado (não está no seu "My Drive"), o
+caminho mais simples é abrir o link no navegador e **"Adicionar atalho ao Drive"**
+(ou copiar para o seu Drive) antes do `rclone copy` — ou usar o atalho `gdown` do B.0.
+
+---
+
+## 6. Extrair + integrity check (pré-processamento)
+
+A partir de `/workspace/mednext`:
+
+```bash
+# integridade do arquivo compactado
+zstd -t pi_cai220_mednext.tar.zst
+
+# inspecionar a árvore (deve começar em data/nnUNet_raw/...)
+tar -I zstd -tvf pi_cai220_mednext.tar.zst | head
+
+# extrair na RAIZ do projeto (o tar já embute data/)
+tar -I zstd -xvf pi_cai220_mednext.tar.zst -C .
+
+# conferir
+ls data/nnUNet_raw/nnUNet_raw_data/Task220_PI-CAI/
+```
+
+Rodar plan + preprocess + **integrity check** (planner custom 1mm isotrópico, que
+gera o plano `nnUNetPlansv2.1_trgSp_1x1x1`). É **CPU-bound**, não usa GPU, e pode
+levar de minutos a dezenas de minutos:
+
+```bash
+mednextv1_plan_and_preprocess -t 220 --verify_dataset_integrity \
+  -pl3d ExperimentPlanner3D_v21_customTargetSpacing_1x1x1 \
+  -pl2d None
+```
+
+Isso cria `data/nnUNet_preprocessed/Task220_PI-CAI/` com os `.npz`/`.pkl` e o
+`nnUNetPlansv2.1_trgSp_1x1x1_plans_3D.pkl`. Como está em `/workspace`, persiste.
+Ajuste paralelismo com `-tf` (threads fullres) e `-tl` (threads lowres) conforme os
+vCPUs do pod.
+
+---
+
+## 7. Treinar — exemplo Medium (M) pesado em H200
+
+O **Medium mais pesado** é o kernel 5, treinado via **UpKern**: primeiro treina-se
+o kernel 3, depois inicializa-se o kernel 5 a partir dele. Sintaxe:
+`mednextv1_train 3d_fullres TRAINER 220 FOLD -p nnUNetPlansv2.1_trgSp_1x1x1`.
+
+**Passo 1 — Medium kernel 3 (base para o UpKern):**
+```bash
+mednextv1_train 3d_fullres nnUNetTrainerV2_MedNeXt_M_kernel3 220 0 \
+  -p nnUNetPlansv2.1_trgSp_1x1x1
+```
+
+**Passo 2 — Medium kernel 5 via UpKern (o "mais pesado"):**
+```bash
+mednextv1_train 3d_fullres nnUNetTrainerV2_MedNeXt_M_kernel5 220 0 \
+  -p nnUNetPlansv2.1_trgSp_1x1x1 \
+  -pretrained_weights /workspace/mednext/outputs/nnUNet_results/nnUNet/3d_fullres/Task220_PI-CAI/nnUNetTrainerV2_MedNeXt_M_kernel3__nnUNetPlansv2.1_trgSp_1x1x1/fold_0/model_final_checkpoint.model \
+  -resample_weights
+```
+A flag `-resample_weights` dispara o algoritmo UpKern (interpolação trilinear dos
+pesos do kernel 3 para o 5).
+
+**Rodar destacado e com log** (treino longo; não perde se a sessão SSH cair):
+```bash
+nohup mednextv1_train 3d_fullres nnUNetTrainerV2_MedNeXt_M_kernel3 220 0 \
+  -p nnUNetPlansv2.1_trgSp_1x1x1 \
+  > /workspace/mednext/train_M_k3_fold0.log 2>&1 &
+tail -f /workspace/mednext/train_M_k3_fold0.log
+```
+
+**Folds:** o exemplo usa fold `0`. Para validação cruzada completa, repita com
+`1`, `2`, `3`, `4`. Acompanhe a GPU com `watch -n 2 nvidia-smi`.
+
+**Notas de hardware (H200 / Medium):** com 141 GB há folga ampla — kernel 5 cabe
+sem gradient checkpointing e dá para aumentar workers do dataloader. Se um dia
+treinar o **Large**, mantenha-se em H100/H200 e considere gradient checkpointing.
+
+---
+
+## 8. Checkpoints e persistência
+
+- Resultados em `RESULTS_FOLDER` → `/workspace/mednext/outputs/nnUNet_results`.
+- Está no Network Volume, então sobrevive ao término do pod.
+- Para arquivar/versionar fora do pod, dá para enviar de volta ao Drive com rclone:
+  ```bash
+  rclone copy /workspace/mednext/outputs/nnUNet_results gdrive:mednext_results -P
+  ```
+
+---
+
+## 9. Referências
+
+- MedNeXt (MIC-DKFZ) e nnUNet v1 (base do pipeline).
+- RunPod — Pods, Network Volumes (persistência em `/workspace`), transferência de
+  arquivos (`runpodctl send/receive`, `rsync`).
+- rclone — backend Google Drive e *remote setup* headless (`rclone authorize`).
